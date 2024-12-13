@@ -7,6 +7,9 @@
 #include <sys/msg.h>
 #include <sys/ipc.h>
 #include <sys/errno.h>
+#include <time.h>
+#include <sys/time.h>
+#include <stdarg.h>  // 이 헤더 추가
 
 #define NUM_CHILDREN 10
 #define PAGE_SIZE 4096    // 4KB
@@ -17,7 +20,7 @@
 #define TIME_QUANTUM 1
 #define PAGES_PER_PROCESS 10 //프로세스마다의 페이지 수
 #define FRAME_SIZE 4            // 페이지 프레임 크기
-#define TOTAL_FRAMES 3         // 총 프레임 개수
+#define TOTAL_FRAMES 20    // 총 프레임 개수
 #define PHYSICAL_MEMORY_SIZE (FRAME_SIZE * TOTAL_FRAMES)
 
 // 프로세스 상태 정의
@@ -27,6 +30,8 @@
 
 // 메시지 큐 키 정의
 #define MSG_KEY 12345
+
+FILE* log_file;
 
 // 페이지 요청을 위한 메시지 구조체
 struct msg_buffer {
@@ -48,6 +53,18 @@ void init_msg_queue() {
     }
     printf("Message queue initialized with ID: %d\n", msgid);
 }
+
+// 전역 통계 변수 추가
+struct Statistics {
+    int total_memory_accesses;
+    int total_page_faults;
+    int total_page_hits;
+    int total_page_replacements;
+    int page_faults_per_process[NUM_CHILDREN];
+    int page_hits_per_process[NUM_CHILDREN];
+} stats = {0};
+
+
 // 전역 변수로 틱 카운트 추가
 int tick_count = 0;
 // 전역 변수로 상태 플래그 추가
@@ -69,8 +86,10 @@ struct Process processes[NUM_CHILDREN];
 void init_process_info(pid_t pid, int p_num) {
     processes[p_num].pid = pid;
     processes[p_num].p_num = p_num;
-    processes[p_num].cpu_burst = 10;
-    processes[p_num].wait_burst = 10;
+    // cpu_burst: 3~10 사이의 랜덤 값
+    processes[p_num].cpu_burst = 3 + rand() % 8;  
+    // wait_burst: 3~10 사이의 랜덤 값
+    processes[p_num].wait_burst = 2 + rand() % 4;  // 2 + (0~3) = 2~5 사이의 값
     processes[p_num].state = PROCESS_READY;
     processes[p_num].is_running = 0;
     processes[p_num].request_sent = 0;
@@ -104,6 +123,7 @@ struct Page {
 struct Frame {
     int is_used;       // 프레임 사용 여부 (0: 미사용, 1: 사용중)
     struct Page page;  // 가상 메모리에서 가져온 페이지 정보
+    int last_access_time; // LRU 구현을 위한 변수 추가
 };
 // 메인 메모리 구조체
 struct PhysicalMemory {
@@ -122,6 +142,7 @@ void init_physical_memory() {
         pmem.frames[i].is_used = 0;
         pmem.frames[i].page.pid = -1;
         pmem.frames[i].page.pagenum = -1;
+        pmem.frames[i].last_access_time = -1;
     }
     pmem.free_frame_count = TOTAL_FRAMES;
     
@@ -216,6 +237,168 @@ void init_page_table() {
     printf("Page Table Initialized\n");
 }
 /*--------------------------------------------------------------------------------- */
+
+//로깅 관련 함수들
+
+// 통계 업데이트 함수들
+void record_page_fault(int process_num) {
+    stats.total_page_faults++;
+    stats.page_faults_per_process[process_num]++;
+}
+
+void record_page_hit(int process_num) {
+    stats.total_page_hits++;
+    stats.page_hits_per_process[process_num]++;
+}
+
+void record_page_replacement() {
+    stats.total_page_replacements++;
+}
+// 로그 작성을 위한 함수
+void write_log(const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    vfprintf(log_file, format, args);
+    fflush(log_file);
+    va_end(args);
+}
+// 최종 통계 출력 함수
+void print_final_statistics() {
+    fprintf(log_file, "\n======================================================\n");
+    fprintf(log_file, "Final Memory Management Statistics\n");
+    fprintf(log_file, "======================================================\n\n");
+    
+    fprintf(log_file, "Overall Statistics:\n");
+    fprintf(log_file, "Total Memory Accesses: %d\n", 
+            stats.total_page_faults + stats.total_page_hits);
+    fprintf(log_file, "Total Page Faults: %d\n", stats.total_page_faults);
+    fprintf(log_file, "Total Page Hits: %d\n", stats.total_page_hits);
+    fprintf(log_file, "Total Page Replacements: %d\n", stats.total_page_replacements);
+    fprintf(log_file, "Page Fault Rate: %.2f%%\n", 
+            (float)stats.total_page_faults / (stats.total_page_faults + stats.total_page_hits) * 100);
+    fprintf(log_file, "Page Hit Rate: %.2f%%\n", 
+            (float)stats.total_page_hits / (stats.total_page_faults + stats.total_page_hits) * 100);
+    
+    fprintf(log_file, "\nPer-Process Statistics:\n");
+    for(int i = 0; i < NUM_CHILDREN; i++) {
+        int total = stats.page_faults_per_process[i] + stats.page_hits_per_process[i];
+        fprintf(log_file, "Process P%d:\n", i);
+        fprintf(log_file, "  Total Accesses: %d\n", total);
+        fprintf(log_file, "  Page Faults: %d\n", stats.page_faults_per_process[i]);
+        fprintf(log_file, "  Page Hits: %d\n", stats.page_hits_per_process[i]);
+        if(total > 0) {
+            fprintf(log_file, "  Page Fault Rate: %.2f%%\n",
+                    (float)stats.page_faults_per_process[i] / total * 100);
+            fprintf(log_file, "  Page Hit Rate: %.2f%%\n",
+                    (float)stats.page_hits_per_process[i] / total * 100);
+        }
+        fprintf(log_file, "\n");
+    }
+    
+    fprintf(log_file, "======================================================\n");
+}
+
+// 로그 파일 초기화 함수
+void init_logging() {
+    log_file = fopen("memory_management.txt", "w");
+    if (log_file == NULL) {
+        perror("Failed to open log file");
+        exit(1);
+    }
+    
+    // 로그 파일 헤더 작성
+    fprintf(log_file, "======================================================\n");
+    fprintf(log_file, "Virtual Memory Management Simulation Log\n");
+    fprintf(log_file, "======================================================\n\n");
+}
+
+// 구분선 출력 함수
+void log_separator() {
+    fprintf(log_file, "------------------------------------------------------\n");
+}
+
+// 메모리 접근 로깅 함수
+void log_memory_access(int tick, int process_num, int page_num, int offset, int frame_num, const char* status) {
+    write_log("[Tick %d] Memory Access\n", tick);
+    write_log("Process: P%d\n", process_num);
+    write_log("Virtual Address: Page %d, Offset 0x%x\n", page_num, offset);
+    
+    if (frame_num != -1) {
+        write_log("Physical Address: Frame %d, Offset 0x%x\n", frame_num, offset);
+    }
+    
+    write_log("Status: %s\n", status);
+    write_log("------------------------------------------------------\n");
+}
+
+// 페이지 폴트 로깅 함수
+void log_page_fault(int tick, int process_num, int page_num) {
+    write_log("[Tick %d] PAGE FAULT\n", tick);
+    write_log("Process: P%d\n", process_num);
+    write_log("Faulting Page: %d\n", page_num);
+    write_log("------------------------------------------------------\n");
+}
+
+// 페이지 테이블 변경 로깅 함수
+void log_page_table_update(int tick, int process_num, int page_num, int new_frame) {
+    write_log("[Tick %d] Page Table Update\n", tick);
+    write_log("Process: P%d\n", process_num);
+    write_log("Page Number: %d\n", page_num);
+    write_log("New Frame: %d\n", new_frame);
+    write_log("------------------------------------------------------\n");
+}
+
+// LRU 페이지 교체 로깅 함수
+void log_page_replacement(int tick, int evicted_pid, int evicted_page, int new_pid, int new_page, int frame) {
+    write_log("[Tick %d] LRU Page Replacement\n", tick);
+    write_log("Evicted Process: P%d, Page: %d\n", evicted_pid, evicted_page);
+    write_log("New Process: P%d, Page: %d\n", new_pid, new_page);
+    write_log("Frame Number: %d\n", frame);
+    write_log("------------------------------------------------------\n");
+}
+
+// 메모리 상태 스냅샷 로깅 함수
+void log_memory_snapshot() {
+    fprintf(log_file, "\n=== Physical Memory Snapshot ===\n");
+    for(int i = 0; i < TOTAL_FRAMES; i++) {
+        if(pmem.frames[i].is_used) {
+            fprintf(log_file, "Frame %2d: Process P%d, Page 0x%x, Last Access: %d\n",
+                    i, pmem.frames[i].page.pid, pmem.frames[i].page.pagenum,
+                    pmem.frames[i].last_access_time);
+        } else {
+            fprintf(log_file, "Frame %2d: Free\n", i);
+        }
+    }
+    fprintf(log_file, "Free Frames: %d\n", pmem.free_frame_count);
+    log_separator();
+}
+
+// 주기적인 통계 로깅 함수
+void log_statistics(int tick) {
+    static int total_page_faults = 0;
+    static int total_page_hits = 0;
+    static int total_replacements = 0;
+    
+    fprintf(log_file, "\n=== Statistics at Tick %d ===\n", tick);
+    fprintf(log_file, "Total Page Faults: %d\n", total_page_faults);
+    fprintf(log_file, "Total Page Hits: %d\n", total_page_hits);
+    fprintf(log_file, "Total Page Replacements: %d\n", total_replacements);
+    fprintf(log_file, "Page Fault Rate: %.2f%%\n", 
+            (float)total_page_faults / (total_page_faults + total_page_hits) * 100);
+    log_separator();
+}
+
+// 로깅 종료 함수
+// close_logging 함수 수정
+void close_logging() {
+    if (log_file != NULL) {
+        print_final_statistics();
+        fclose(log_file);
+    }
+}
+/*--------------------------------------------------------------------------------- */
+
+
 // running queue의 첫 번째 프로세스를 running 상태로 만드는 함수
 void set_process_running() {
     if(running_queue_size > 0) {
@@ -366,14 +549,14 @@ void child_process(int p_num) {
     struct msg_buffer message;
     message.msg_type = 1;
     message.process_num = p_num;
-    int current_page = 0;
+    int random_page = rand() % PAGES_PER_PROCESS;
     
     printf("Child process %d started, waiting for signals...\n", processes[child_p_num].pid);
     
     while(1) {
         if(processes[child_p_num].is_running && !processes[child_p_num].request_sent) {
-            message.page_number = current_page;
-            current_page = (current_page + 1) % PAGES_PER_PROCESS;
+            message.page_number = random_page;
+            random_page = rand() % PAGES_PER_PROCESS;
             message.offset = rand() % PAGE_SIZE;
             
             while(1) {
@@ -393,27 +576,106 @@ void child_process(int p_num) {
 }
 
 // 페이지 요청 처리 함수
+// handle_page_request() 내부 LRU 알고리즘 적용 부분
 void handle_page_request() {
+    static int last_snapshot_tick = 0;
     struct msg_buffer message;
     
-    // 메시지 즉시 수신 및 처리
     if(msgrcv(msgid, &message, sizeof(message) - sizeof(long), 1, IPC_NOWAIT) != -1) {
-        printf("\n[KERNEL] Received page request from process %d for page %d and offset %d\n", 
-               message.process_num, message.page_number,message.offset);
+        int proc_num = message.process_num;
+        int page_num = message.page_number;
+        int offset = message.offset;
+
+        stats.total_memory_accesses++; // 전체 메모리 접근 횟수 증가
         
-        // 페이지 테이블 엔트리 확인
-        if(page_table[message.process_num][message.page_number].valid == 0) {
-            printf("Page fault: Process %d, Page %d\n", 
-                   message.process_num, message.page_number);
-            // TODO: 페이지 폴트 처리 로직 구현
+        // 메모리 접근 시도 로깅
+        log_memory_access(tick_count, proc_num, page_num, offset, -1, "Memory Access Attempted");
+
+        struct PageTable* pte = &page_table[proc_num][page_num];
+
+        // 페이지 히트
+        if(pte->valid == 1) {
+            int frame_num = pte->frame_number;
+            pmem.frames[frame_num].last_access_time = tick_count;
+            
+            stats.total_page_hits++; // 페이지 히트 수 증가
+            stats.page_hits_per_process[proc_num]++; // 프로세스별 히트 수 증가
+            
+            log_memory_access(tick_count, proc_num, page_num, offset, 
+                            frame_num, "Page Hit - Memory Access Successful");
+            return;
+        }
+
+        // 페이지 폴트
+        stats.total_page_faults++; // 페이지 폴트 수 증가
+        stats.page_faults_per_process[proc_num]++; // 프로세스별 폴트 수 증가
+        log_page_fault(tick_count, proc_num, page_num);
+
+        // 빈 프레임이 있는 경우
+        if(pmem.free_frame_count > 0) {
+            int free_frame = -1;
+            for(int i = 0; i < TOTAL_FRAMES; i++) {
+                if(!pmem.frames[i].is_used) {
+                    free_frame = i;
+                    break;
+                }
+            }
+
+            pmem.frames[free_frame].is_used = 1;
+            pmem.frames[free_frame].page.pid = proc_num;
+            pmem.frames[free_frame].page.pagenum = page_num;
+            pmem.frames[free_frame].last_access_time = tick_count;
+            pmem.free_frame_count--;
+
+            pte->frame_number = free_frame;
+            pte->valid = 1;
+
+            log_page_table_update(tick_count, proc_num, page_num, free_frame);
+            log_memory_access(tick_count, proc_num, page_num, offset, 
+                            free_frame, "New Page Loaded Successfully");
         } else {
-            printf("Page hit: Process %d accessing page %d in frame %d\n", 
-                   message.process_num, 
-                   message.page_number,
-                   page_table[message.process_num][message.page_number].frame_number);
+            // LRU 교체
+            int lru_frame = 0;
+            int oldest_time = pmem.frames[0].last_access_time;
+            
+            for (int i = 1; i < TOTAL_FRAMES; i++) {
+                if (pmem.frames[i].last_access_time < oldest_time) {
+                    oldest_time = pmem.frames[i].last_access_time;
+                    lru_frame = i;
+                }
+            }
+
+            int evict_pid = pmem.frames[lru_frame].page.pid;
+            int evict_pagenum = pmem.frames[lru_frame].page.pagenum;
+
+            stats.total_page_replacements++; // 페이지 교체 수 증가
+            
+            log_page_replacement(tick_count, evict_pid, evict_pagenum, 
+                               proc_num, page_num, lru_frame);
+
+            page_table[evict_pid][evict_pagenum].valid = 0;
+            page_table[evict_pid][evict_pagenum].frame_number = -1;
+
+            pmem.frames[lru_frame].page.pid = proc_num;
+            pmem.frames[lru_frame].page.pagenum = page_num;
+            pmem.frames[lru_frame].last_access_time = tick_count;
+
+            pte->frame_number = lru_frame;
+            pte->valid = 1;
+
+            log_memory_access(tick_count, proc_num, page_num, offset, 
+                            lru_frame, "Page Replacement Complete");
+        }
+
+        // 100 틱마다 메모리 스냅샷과 통계 출력
+        if(tick_count - last_snapshot_tick >= 100) {
+            log_memory_snapshot();
+            log_statistics(tick_count);
+            last_snapshot_tick = tick_count;
         }
     }
 }
+
 void parent_process() {
     static int current_running_pid = -1;
     
@@ -455,23 +717,34 @@ void alarm_handler(int signo) {
 }
 /*--------------------------------------------------------------------------------- */
 
-
 int main() {
     pid_t pid;
     pid_t child_pids[NUM_CHILDREN];
-
-    //가상 메모리 초기화
+    time_t start_time = time(NULL);
+    
+    // 난수 생성기 초기화
+    srand(time(NULL));
+    
+    // 각종 초기화
     init_virtual_memory();
-    //메인 메모리 초기화
     init_physical_memory();
-    //페이지 테이블 초기화
     init_page_table();
     init_msg_queue();
+    init_logging();
+    
+    // 타이머 설정
+    struct itimerval timer;
+    timer.it_value.tv_sec = 0;
+    timer.it_value.tv_usec = 1000;  // 1000 마이크로초 = 0.001초
+    timer.it_interval = timer.it_value;
 
     // SIGALRM 핸들러 등록
     signal(SIGALRM, alarm_handler);
 
-    printf("Starting virtual memory simulation...\n");
+    printf("\n=== Starting Virtual Memory Management Simulation ===\n");
+    printf("Total Pages: %d, Total Frames: %d\n", TOTAL_PAGES, TOTAL_FRAMES);
+    printf("Page Size: %d bytes\n", PAGE_SIZE);
+    printf("Physical Memory Size: %d bytes\n\n", PHYSICAL_MEMORY_SIZE);
 
     // 자식 프로세스 생성
     for(int i = 0; i < NUM_CHILDREN; i++) {
@@ -487,27 +760,60 @@ int main() {
         }
         else {
             child_pids[i] = pid;
-            init_process_info(pid, i);        // 프로세스 정보 초기화
+            init_process_info(pid, i);
             register_process_pages(i);
             add_to_running_queue(&processes[i]); 
             printf("Created child process %d with PID: %d\n", i + 1, pid);
         }
     }
 
+    // 첫 번째 프로세스 실행
     parent_process();
-      while(tick_count < 10000) {
-        alarm(TIME_QUANTUM);  // 1초 후에 알람 발생
-        pause();         // 1초 대기
+    
+    // 타이머 시작
+    if (setitimer(ITIMER_REAL, &timer, NULL) == -1) {
+        perror("setitimer");
+        exit(1);
+    }
+    
+    printf("\nTimer started. Running simulation for 10000 ticks...\n");
+    
+    // 10000 틱까지 실행
+    while(tick_count < 10000) {
+        pause();
     }
 
+    // 타이머 중지
+    struct itimerval stop_timer = {0};
+    setitimer(ITIMER_REAL, &stop_timer, NULL);
+
+    printf("\n=== Simulation completed at tick %d ===\n", tick_count);
+    time_t end_time = time(NULL);
+    printf("Total simulation time: %ld seconds\n", end_time - start_time);
+
+    // 자식 프로세스들 종료
+    printf("\nTerminating child processes...\n");
+    for(int i = 0; i < NUM_CHILDREN; i++) {
+        kill(child_pids[i], SIGTERM);
+    }
+
+    // 자식 프로세스들이 완전히 종료될 때까지 대기
     for(int i = 0; i < NUM_CHILDREN; i++) {
         waitpid(child_pids[i], NULL, 0);
+        printf("Child process %d terminated\n", child_pids[i]);
     }
 
-     // 시뮬레이션 종료 시 메시지 큐 제거
-    msgctl(msgid, IPC_RMID, NULL);
+    // 메시지 큐 제거
+    if (msgctl(msgid, IPC_RMID, NULL) == -1) {
+        perror("Failed to remove message queue");
+    } else {
+        printf("Message queue removed successfully\n");
+    }
 
-
-
+    // 최종 통계 출력 및 로그 파일 닫기
+    printf("\nWriting final statistics to log file...\n");
+    close_logging();
+    
+    printf("\n=== Simulation Ended Successfully ===\n");
     return 0;
 }
